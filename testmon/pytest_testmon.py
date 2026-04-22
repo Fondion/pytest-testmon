@@ -3,6 +3,7 @@
 Main module of testmon pytest plugin.
 """
 
+import hashlib
 import time
 import xmlrpc.client
 import os
@@ -441,7 +442,13 @@ def changed_message(
             )
     if config.testmon_data.environment:
         branch = getattr(config.testmon_data, "branch", "")
-        message += f"environment: {environment}, branch: {branch}"
+        python = getattr(config.testmon_data, "python_version_str", "")
+        pkgs = getattr(config.testmon_data, "system_packages_str", "")
+        pkg_hash = hashlib.sha1(pkgs.encode()).hexdigest()[:8] if pkgs else ""
+        message += (
+            f"environment: {environment}, python: {python}, "
+            f"packages: {pkg_hash}, branch: {branch}"
+        )
     return message
 
 
