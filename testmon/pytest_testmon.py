@@ -31,7 +31,12 @@ from testmon.testmon_core import (
     get_data_file_path,
 )
 from testmon import configure
-from testmon.common import get_logger, get_system_packages, git_current_branch
+from testmon.common import (
+    get_logger,
+    get_system_packages,
+    git_current_branch,
+    git_pr_target_branch,
+)
 
 SURVEY_NOTIFICATION_INTERVAL = timedelta(days=28)
 
@@ -255,7 +260,11 @@ def init_testmon_data(config: Config):
         pkg_str = drop_patch_version(system_packages)
         py_str = f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}"
 
-        fallback_branch = config.getini("testmon_s3_fallback_branch") or "main"
+        fallback_branch = (
+            git_pr_target_branch()
+            or config.getini("testmon_s3_fallback_branch")
+            or "main"
+        )
         readonly = config.getoption("testmon_s3_readonly")
         force_remote = config.getoption("testmon_s3_force_remote")
         local_db_path = os.path.join(config.rootdir.strpath, get_data_file_path())
@@ -557,9 +566,7 @@ class TestmonCollect:
                         "terminalreporter"
                     )
                     if reporter is not None:
-                        reporter.write_line(
-                            f"testmon: uploaded results to {s3.s3_url}"
-                        )
+                        reporter.write_line(f"testmon: uploaded results to {s3.s3_url}")
                 s3.cleanup()
         self.testmon.close()
 

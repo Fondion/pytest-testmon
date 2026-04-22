@@ -143,6 +143,29 @@ def git_current_branch(path=None):
     return None  # detached HEAD with no CI env var
 
 
+def git_pr_target_branch() -> str | None:
+    """
+    Return the target (base) branch of the current PR/MR, or None if not in a PR context.
+
+    Priority:
+      TESTMON_FALLBACK_BRANCH   – explicit override
+      GITHUB_BASE_REF           – GitHub Actions (PR/push to branch)
+      CI_MERGE_REQUEST_TARGET_BRANCH_NAME – GitLab CI merge request
+      BITBUCKET_PR_DESTINATION_BRANCH     – Bitbucket Pipelines
+      CHANGE_TARGET             – Jenkins multibranch pipeline
+    """
+    for var in (
+        "TESTMON_FALLBACK_BRANCH",
+        "GITHUB_BASE_REF",
+        "CI_MERGE_REQUEST_TARGET_BRANCH_NAME",
+        "BITBUCKET_PR_DESTINATION_BRANCH",
+        "CHANGE_TARGET",
+    ):
+        if branch := os.environ.get(var, "").strip():
+            return branch
+    return None
+
+
 def git_current_head(path=None):
     path = git_path(path)
     if not path:
