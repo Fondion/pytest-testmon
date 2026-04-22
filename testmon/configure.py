@@ -33,6 +33,7 @@ def _get_notestmon_reasons(options):
             "testmon_nocollect",
             "testmon_forceselect",
             "tmnet",
+            "testmon_s3",
         ]
     ):
         return "not mentioned"

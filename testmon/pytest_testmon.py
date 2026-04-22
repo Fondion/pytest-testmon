@@ -430,7 +430,8 @@ def changed_message(
                 else f"changed files: {changed_files_msg}, unchanged files: {len(stable_files)}, "
             )
     if config.testmon_data.environment:
-        message += f"environment: {environment}"
+        branch = getattr(config.testmon_data, "branch", "")
+        message += f"environment: {environment}, branch: {branch}"
     return message
 
 
@@ -535,6 +536,13 @@ class TestmonCollect:
                         td.python_version_str,
                         td.branch,
                     )
+                    reporter = session.config.pluginmanager.get_plugin(
+                        "terminalreporter"
+                    )
+                    if reporter is not None:
+                        reporter.write_line(
+                            f"testmon: uploaded results to {s3.s3_url}"
+                        )
                 s3.cleanup()
         self.testmon.close()
 
