@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import time
 
 from collections import namedtuple
 from functools import lru_cache
@@ -10,7 +11,7 @@ from testmon.process_code import blob_to_checksums, checksums_to_blob
 from testmon.common import TestExecutions
 
 
-DATA_VERSION = 14
+DATA_VERSION = 15
 
 ChangedFileData = namedtuple(
     "ChangedFileData", "filename name method_checksums id failed"
@@ -106,6 +107,7 @@ class DB:  # pylint: disable=too-many-public-methods
         self.update_saving_stats(exec_id, select)
         self.fetch_or_create_file_fp.cache_clear()
         with self.con as con:
+            self._cleanup_old_environments(con)
             self.vacuum_file_fp(con)
 
     def vacuum_file_fp(self, con):
@@ -113,6 +115,13 @@ class DB:  # pylint: disable=too-many-public-methods
             """ DELETE FROM file_fp
                 WHERE id NOT IN (
                     SELECT DISTINCT fingerprint_id FROM test_execution_file_fp) """
+        )
+
+    def _cleanup_old_environments(self, con, days=30):
+        cutoff = int(time.time()) - days * 24 * 3600
+        con.execute(
+            "DELETE FROM environment WHERE last_used_at IS NOT NULL AND last_used_at < ?",
+            (cutoff,),
         )
 
     def fetch_current_run_stats(self, exec_id):
@@ -347,6 +356,7 @@ class DB:  # pylint: disable=too-many-public-methods
                 environment_name TEXT,
                 system_packages TEXT,
                 python_version TEXT,
+                last_used_at INTEGER,
                 UNIQUE (environment_name, system_packages, python_version)
             );"""
 
@@ -647,68 +657,54 @@ class DB:  # pylint: disable=too-many-public-methods
     def fetch_or_create_environment(
         self, environment_name, system_packages, python_version
     ):
+        now = int(time.time())
         with self.con as con:
             con.execute("BEGIN IMMEDIATE TRANSACTION")
             cursor = con.cursor()
+
+            # Look for an exact match on all three dimensions.
             environment = cursor.execute(
                 """
-                SELECT
-                id, environment_name, system_packages, python_version
-                FROM environment
-                WHERE environment_name = ?
-                ORDER BY id DESC
+                SELECT id FROM environment
+                WHERE environment_name = ? AND system_packages = ? AND python_version = ?
                 """,
-                (environment_name,),
-            ).fetchone()  # TODO to pick best environment of many with the same name, we would need to fetch all.
+                (environment_name, system_packages, python_version),
+            ).fetchone()
 
             if environment:
-                environment_id = environment["id"]
-                packages_changed = (
-                    environment["system_packages"] != system_packages
-                    or environment["python_version"] != python_version
+                cursor.execute(
+                    "UPDATE environment SET last_used_at = ? WHERE id = ?",
+                    (now, environment["id"]),
                 )
-            else:
-                packages_changed = False
-            if not environment:
-                try:
-                    cursor.execute(
-                        """
-                        INSERT INTO environment (environment_name, system_packages, python_version)
-                        VALUES (?, ?, ?)
-                        """,
-                        (
-                            environment_name,
-                            system_packages,
-                            python_version,
-                        ),
-                    )
-                    environment_id = cursor.lastrowid
-                except sqlite3.IntegrityError:
-                    environment = con.execute(
-                        """
-                        SELECT
-                        id as id, environment_name as name, system_packages as packages
-                        FROM environment
-                        WHERE environment_name = ?
-                        """,
-                        (environment_name,),
-                    ).fetchone()
-                    environment_id = environment["id"]
-            elif packages_changed:
+                return environment["id"], False
+
+            # No exact match — check whether this name has ever been used so we
+            # can signal to the caller that the package set has changed.
+            name_existed = cursor.execute(
+                "SELECT 1 FROM environment WHERE environment_name = ?",
+                (environment_name,),
+            ).fetchone() is not None
+
+            try:
                 cursor.execute(
                     """
-                    INSERT INTO environment (environment_name, system_packages, python_version)
-                    VALUES (?, ?, ?)
+                    INSERT INTO environment
+                        (environment_name, system_packages, python_version, last_used_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (environment_name, system_packages, python_version, now),
+                )
+                return cursor.lastrowid, name_existed
+            except sqlite3.IntegrityError:
+                # Another process inserted the exact same row concurrently.
+                environment = cursor.execute(
+                    """
+                    SELECT id FROM environment
+                    WHERE environment_name = ? AND system_packages = ? AND python_version = ?
                     """,
                     (environment_name, system_packages, python_version),
-                )
-                new_environment_id = cursor.lastrowid
-                cursor.execute(
-                    "DELETE FROM environment WHERE id = ?", (environment_id,)
-                )
-                environment_id = new_environment_id
-
-            return environment_id, packages_changed
+                ).fetchone()
+                return environment["id"], False
 
     def initiate_execution(  # pylint: disable= R0913 W0613
         self,
