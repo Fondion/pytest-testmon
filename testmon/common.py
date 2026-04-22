@@ -110,18 +110,37 @@ def git_path(start_path=None):  # parent dirs only
 
 
 def git_current_branch(path=None):
-    path = git_path(path)
-    if not path:
+    # Explicit override always wins.
+    if branch := os.environ.get("TESTMON_BRANCH", "").strip():
+        return branch
+
+    # GitHub Actions: GITHUB_HEAD_REF is the PR source branch (only set on PRs).
+    if branch := os.environ.get("GITHUB_HEAD_REF", "").strip():
+        return branch
+
+    # GitHub Actions: GITHUB_REF_NAME is the branch name on push events but
+    # looks like "123/merge" on PR events — skip those.
+    if branch := os.environ.get("GITHUB_REF_NAME", "").strip():
+        if "/" not in branch:
+            return branch
+
+    # GitLab CI / generic CI env vars.
+    for var in ("CI_COMMIT_BRANCH", "GIT_BRANCH", "BRANCH_NAME"):
+        if branch := os.environ.get(var, "").strip():
+            return branch
+
+    # Fall back to reading the .git/HEAD file directly.
+    git_dir = git_path(path)
+    if not git_dir:
         return None
-    git_head_file = os.path.join(path, "HEAD")
     try:
-        with open(git_head_file, "r", encoding="utf8") as head_file:
-            head_content = head_file.read().strip()
-        if head_content.startswith("ref:"):
-            return head_content.split("/")[-1]  # e.g. ref: refs/heads/master
+        with open(os.path.join(git_dir, "HEAD"), "r", encoding="utf8") as f:
+            head = f.read().strip()
+        if head.startswith("ref:"):
+            return head.split("/")[-1]  # e.g. "ref: refs/heads/main" → "main"
     except FileNotFoundError:
         pass
-    return None
+    return None  # detached HEAD with no CI env var
 
 
 def git_current_head(path=None):

@@ -2,6 +2,7 @@
 """
 Main module of testmon pytest plugin.
 """
+
 import time
 import xmlrpc.client
 import os
@@ -28,7 +29,7 @@ from testmon.testmon_core import (
     cached_relpath,
 )
 from testmon import configure
-from testmon.common import get_logger, get_system_packages
+from testmon.common import get_logger, get_system_packages, git_current_branch
 
 SURVEY_NOTIFICATION_INTERVAL = timedelta(days=28)
 
@@ -115,6 +116,48 @@ def pytest_addoption(parser):
         ),
     )
 
+    group.addoption(
+        "--testmon-s3",
+        action="store",
+        dest="testmon_s3",
+        default=None,
+        metavar="S3_URL",
+        help=(
+            "S3 URL (s3://bucket/key) for shared SQLite cache. "
+            "Downloads at session start; read-only unless --testmon-s3-write is also given."
+        ),
+    )
+
+    group.addoption(
+        "--testmon-s3-write",
+        action="store_true",
+        dest="testmon_s3_write",
+        help="Merge this run's results back to S3 at session end (requires --testmon-s3).",
+    )
+
+    group.addoption(
+        "--testmon-s3-force-pull",
+        action="store_true",
+        dest="testmon_s3_force_pull",
+        help=(
+            "Always re-download the S3 cache even when the local DB already has "
+            "data for the current branch."
+        ),
+    )
+
+    group.addoption(
+        "--testmon-s3-branch",
+        action="store",
+        dest="testmon_s3_branch",
+        default=None,
+        metavar="BRANCH",
+        help=(
+            "Branch name used as a cache key. "
+            "Auto-detected from git/CI env vars when omitted. "
+            "Pass an empty string to disable branch discrimination."
+        ),
+    )
+
     parser.addini("environment_expression", "environment expression", default="")
     parser.addini(
         "testmon_ignore_dependencies",
@@ -124,6 +167,14 @@ def pytest_addoption(parser):
     )
     parser.addini("tmnet_url", "URL of the testmon.net api server.")
     parser.addini("tmnet_api_key", "testmon api key")
+    parser.addini(
+        "testmon_s3_url", "S3 URL for shared testmon cache (s3://bucket/key)."
+    )
+    parser.addini(
+        "testmon_s3_fallback_branch",
+        "Branch to seed from when current branch has no S3 cache (default: main).",
+        default="main",
+    )
 
 
 def testmon_options(config):
@@ -138,14 +189,22 @@ def testmon_options(config):
     return result
 
 
+def _resolve_branch(config: Config) -> str:
+    override = config.getoption("testmon_s3_branch")
+    if override is not None:
+        return override  # empty string explicitly disables branch discrimination
+    return git_current_branch() or ""
+
+
 def init_testmon_data(config: Config):
     environment = config.getoption("environment_expression") or eval_environment(
         config.getini("environment_expression")
     )
     ignore_dependencies = config.getini("testmon_ignore_dependencies")
-
     system_packages = get_system_packages(ignore=ignore_dependencies)
+    branch = _resolve_branch(config)
 
+    # --- legacy tmnet proxy ---
     url = config.getini("tmnet_url")
     rpc_proxy = None
 
@@ -178,38 +237,70 @@ def init_testmon_data(config: Config):
                 headers=[("x-api-key", tmnet_api_key.strip())],
             )
 
-    # Check if we're a worker and have exec_id from controller
+    # --- S3 storage ---
+    database = rpc_proxy  # may be overridden by S3 below
+    s3_url = config.getoption("testmon_s3") or config.getini("testmon_s3_url")
+
     running_as = get_running_as(config)
+
+    if s3_url and running_as != "worker":
+        import sys as _sys
+
+        from testmon.storage_s3 import S3Storage
+        from testmon.common import drop_patch_version
+
+        fallback_branch = config.getini("testmon_s3_fallback_branch") or "main"
+        readonly = not config.getoption("testmon_s3_write")
+        force_pull = config.getoption("testmon_s3_force_pull")
+        s3 = S3Storage(s3_url, readonly=readonly, fallback_branch=fallback_branch)
+        database = s3.setup(force_pull=force_pull)
+
+        # Seed branch data from fallback before initiate_execution so the
+        # seeded environment row is found rather than created empty.
+        env_name = environment if environment else "default"
+        pkg_str = drop_patch_version(system_packages)
+        py_str = f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}"
+        s3.seed_from_fallback(env_name, pkg_str, py_str, branch)
+
+        config._testmon_s3 = s3
+
+    # --- xdist worker input ---
     exec_id = None
     system_packages_change = None
     files_of_interest = None
 
     if running_as == "worker" and hasattr(config, "workerinput"):
-        # Use exec_id sent from controller
         exec_id = config.workerinput.get("testmon_exec_id")
         system_packages_change = config.workerinput.get(
             "testmon_system_packages_change"
         )
         files_of_interest = config.workerinput.get("testmon_files_of_interest")
 
+        # If the controller used an S3 temp file, open a readonly connection to it.
+        s3_db_path = config.workerinput.get("testmon_s3_db_path")
+        if s3_db_path and os.path.exists(s3_db_path):
+            from testmon import db as _db
+
+            database = _db.DB(s3_db_path, readonly=True)
+
     if running_as == "worker" and exec_id is not None:
-        # Initialize for xdist worker run
         testmon_data: TestmonData = TestmonData.for_worker(
             rootdir=config.rootdir.strpath,
             exec_id=exec_id,
-            database=rpc_proxy,
+            database=database,
             system_packages_change=system_packages_change,
             files_of_interest=files_of_interest,
             environment=environment,
         )
     else:
-        # Initialize for local run (controller or single process)
         testmon_data: TestmonData = TestmonData.for_local_run(
             rootdir=config.rootdir.strpath,
-            database=rpc_proxy,
+            database=database,
             environment=environment,
             system_packages=system_packages,
+            branch=branch,
         )
+
     testmon_data.determine_stable()
     config.testmon_data = testmon_data
 
@@ -360,11 +451,10 @@ class TestmonCollect:
         self.raw_test_names = []
         self.cov_plugin = cov_plugin
         self._sessionstarttime = time.time()
+        self._delta = {}  # fingerprints written this session, for S3 merge
 
     @pytest.hookimpl(tryfirst=True, hookwrapper=True)
-    def pytest_pycollect_makeitem(
-        self, collector, name, obj
-    ):  # pylint: disable=unused-argument
+    def pytest_pycollect_makeitem(self, collector, name, obj):  # pylint: disable=unused-argument
         makeitem_result = yield
         items = makeitem_result.get_result() or []
         try:
@@ -375,9 +465,7 @@ class TestmonCollect:
             pass
 
     @pytest.hookimpl(tryfirst=True)
-    def pytest_collection_modifyitems(
-        self, session, config, items
-    ):  # pylint: disable=unused-argument
+    def pytest_collection_modifyitems(self, session, config, items):  # pylint: disable=unused-argument
         should_sync = not session.testsfailed and self._running_as in (
             "single",
             "controller",
@@ -386,9 +474,7 @@ class TestmonCollect:
             config.testmon_data.sync_db_fs_tests(retain=set(self.raw_test_names))
 
     @pytest.hookimpl(hookwrapper=True)
-    def pytest_runtest_protocol(
-        self, item, nextitem
-    ):  # pylint: disable=unused-argument
+    def pytest_runtest_protocol(self, item, nextitem):  # pylint: disable=unused-argument
         self.testmon.start_testmon(item.nodeid, nextitem.nodeid if nextitem else None)
         result = yield
         if result.excinfo and issubclass(result.excinfo[0], BaseException):
@@ -419,6 +505,7 @@ class TestmonCollect:
                 self.testmon_data.save_test_execution_file_fps(
                     test_executions_fingerprints
                 )
+                self._delta.update(test_executions_fingerprints)
 
     def pytest_keyboard_interrupt(self, excinfo):  # pylint: disable=unused-argument
         if self._running_as == "single":
@@ -437,6 +524,18 @@ class TestmonCollect:
                 time.time() - self._sessionstarttime,
                 session.config.testmon_config.select,
             )
+            s3 = getattr(session.config, "_testmon_s3", None)
+            if s3 is not None:
+                if not s3.readonly and self._delta:
+                    td = self.testmon_data
+                    s3.merge_and_upload(
+                        self._delta,
+                        td.environment,
+                        td.system_packages_str,
+                        td.python_version_str,
+                        td.branch,
+                    )
+                s3.cleanup()
         self.testmon.close()
 
 
@@ -463,19 +562,21 @@ class TestmonXdistSync:
         if hasattr(node.config, "testmon_data") and hasattr(node, "workerinput"):
             testmon_data: TestmonData = node.config.testmon_data
             node.workerinput["testmon_exec_id"] = testmon_data.exec_id
-            node.workerinput[
-                "testmon_system_packages_change"
-            ] = testmon_data.system_packages_change
-            node.workerinput[
-                "testmon_files_of_interest"
-            ] = testmon_data.files_of_interest
+            node.workerinput["testmon_system_packages_change"] = (
+                testmon_data.system_packages_change
+            )
+            node.workerinput["testmon_files_of_interest"] = (
+                testmon_data.files_of_interest
+            )
+            s3 = getattr(node.config, "_testmon_s3", None)
+            node.workerinput["testmon_s3_db_path"] = (
+                s3._local_db_path if s3 is not None else None
+            )
 
     def pytest_testnodeready(self, node):  # pylint: disable=unused-argument
         self.await_nodes += 1
 
-    def pytest_xdist_node_collection_finished(
-        self, node, ids
-    ):  # pylint: disable=invalid-name
+    def pytest_xdist_node_collection_finished(self, node, ids):  # pylint: disable=invalid-name
         self.await_nodes += -1
         if self.await_nodes == 0:
             node.config.testmon_data.sync_db_fs_tests(retain=set(ids))
@@ -536,9 +637,7 @@ class TestmonSelect:
         return None
 
     @pytest.hookimpl(trylast=True)
-    def pytest_collection_modifyitems(
-        self, session, config, items
-    ):  # pylint: disable=unused-argument
+    def pytest_collection_modifyitems(self, session, config, items):  # pylint: disable=unused-argument
         selected = []
         deselected = []
         for item in items:

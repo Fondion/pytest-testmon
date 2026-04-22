@@ -71,6 +71,7 @@ class SourceTree:
       copy for further operations. Also caches the mtime.)
     - store rootdir and convert between relative and absolute paths
     - implement the check if the file is changed based on mtime, fsha.
+
     - implement the ckeck if the node is stable based on fingerprint
     - mockability (unit tests without filesystem, check if the file is changed
       based on mtime, fsha)
@@ -193,9 +194,12 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         environment=None,
         system_packages=None,
         python_version=None,
+        branch="",
     ):
         instance = cls(rootdir, database=database, readonly=False)
-        instance._init_for_local_run(environment, system_packages, python_version)
+        instance._init_for_local_run(
+            environment, system_packages, python_version, branch
+        )
         return instance
 
     def _init_for_local_run(
@@ -203,18 +207,20 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         environment=None,
         system_packages=None,
         python_version=None,
+        branch="",
     ):
-        """Internal method to initialize for local run."""
         self.environment = environment if environment else "default"
+        self.branch = branch
 
         if system_packages is None:
             system_packages = get_system_packages()
         system_packages = drop_patch_version(system_packages)
+        self.system_packages_str = system_packages
 
         if not python_version:
             python_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        self.python_version_str = python_version
 
-        # Initiate execution (controller or single process)
         try:
             result = self.db.initiate_execution(
                 self.environment,
@@ -225,6 +231,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                     "git_head_sha": git_current_head(),
                     "ci": os.environ.get("CI"),
                 },
+                branch=branch,
             )
         except (ConnectionRefusedError, Fault, ProtocolError, gaierror) as exc:
             logger.error(
@@ -234,11 +241,9 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
                 ),
                 exc,
             )
-            self.db = db.DB(
-                os.path.join(self.rootdir, get_data_file_path())
-            )  # pylint: disable=invalid-name
+            self.db = db.DB(os.path.join(self.rootdir, get_data_file_path()))  # pylint: disable=invalid-name
             result = self.db.initiate_execution(
-                self.environment, system_packages, python_version, {}
+                self.environment, system_packages, python_version, {}, branch=branch
             )
 
         self.exec_id = result["exec_id"]

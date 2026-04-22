@@ -11,7 +11,7 @@ from testmon.process_code import blob_to_checksums, checksums_to_blob
 from testmon.common import TestExecutions
 
 
-DATA_VERSION = 15
+DATA_VERSION = 16
 
 ChangedFileData = namedtuple(
     "ChangedFileData", "filename name method_checksums id failed"
@@ -101,9 +101,7 @@ class DB:  # pylint: disable=too-many-public-methods
                 "UPDATE file_fp SET mtime=?, fsha=? WHERE id = ?", new_mtimes
             )
 
-    def finish_execution(
-        self, exec_id, duration=None, select=True
-    ):  # pylint: disable=unused-argument
+    def finish_execution(self, exec_id, duration=None, select=True):  # pylint: disable=unused-argument
         self.update_saving_stats(exec_id, select)
         self.fetch_or_create_file_fp.cache_clear()
         with self.con as con:
@@ -202,9 +200,7 @@ class DB:  # pylint: disable=too-many-public-methods
         )
 
     @lru_cache(1000)
-    def fetch_or_create_file_fp(
-        self, filename, fsha, method_checksums
-    ):  # pylint: disable=R0801
+    def fetch_or_create_file_fp(self, filename, fsha, method_checksums):  # pylint: disable=R0801
         cursor = self.con.cursor()
         try:
             cursor.execute(
@@ -356,8 +352,9 @@ class DB:  # pylint: disable=too-many-public-methods
                 environment_name TEXT,
                 system_packages TEXT,
                 python_version TEXT,
+                branch TEXT NOT NULL DEFAULT '',
                 last_used_at INTEGER,
-                UNIQUE (environment_name, system_packages, python_version)
+                UNIQUE (environment_name, system_packages, python_version, branch)
             );"""
 
     def _create_test_execution_statement(self) -> str:  # pylint: disable=invalid-name
@@ -655,20 +652,19 @@ class DB:  # pylint: disable=too-many-public-methods
         return [dict(row) for row in cursor]
 
     def fetch_or_create_environment(
-        self, environment_name, system_packages, python_version
+        self, environment_name, system_packages, python_version, branch=""
     ):
         now = int(time.time())
         with self.con as con:
             con.execute("BEGIN IMMEDIATE TRANSACTION")
             cursor = con.cursor()
 
-            # Look for an exact match on all three dimensions.
             environment = cursor.execute(
                 """
                 SELECT id FROM environment
-                WHERE environment_name = ? AND system_packages = ? AND python_version = ?
+                WHERE environment_name = ? AND system_packages = ? AND python_version = ? AND branch = ?
                 """,
-                (environment_name, system_packages, python_version),
+                (environment_name, system_packages, python_version, branch),
             ).fetchone()
 
             if environment:
@@ -678,21 +674,24 @@ class DB:  # pylint: disable=too-many-public-methods
                 )
                 return environment["id"], False
 
-            # No exact match — check whether this name has ever been used so we
-            # can signal to the caller that the package set has changed.
-            name_existed = cursor.execute(
-                "SELECT 1 FROM environment WHERE environment_name = ?",
-                (environment_name,),
-            ).fetchone() is not None
+            # No exact match — check whether this name+branch has ever been used
+            # so we can signal to the caller that the package set has changed.
+            name_existed = (
+                cursor.execute(
+                    "SELECT 1 FROM environment WHERE environment_name = ? AND branch = ?",
+                    (environment_name, branch),
+                ).fetchone()
+                is not None
+            )
 
             try:
                 cursor.execute(
                     """
                     INSERT INTO environment
-                        (environment_name, system_packages, python_version, last_used_at)
-                    VALUES (?, ?, ?, ?)
+                        (environment_name, system_packages, python_version, branch, last_used_at)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (environment_name, system_packages, python_version, now),
+                    (environment_name, system_packages, python_version, branch, now),
                 )
                 return cursor.lastrowid, name_existed
             except sqlite3.IntegrityError:
@@ -700,9 +699,9 @@ class DB:  # pylint: disable=too-many-public-methods
                 environment = cursor.execute(
                     """
                     SELECT id FROM environment
-                    WHERE environment_name = ? AND system_packages = ? AND python_version = ?
+                    WHERE environment_name = ? AND system_packages = ? AND python_version = ? AND branch = ?
                     """,
-                    (environment_name, system_packages, python_version),
+                    (environment_name, system_packages, python_version, branch),
                 ).fetchone()
                 return environment["id"], False
 
@@ -712,12 +711,84 @@ class DB:  # pylint: disable=too-many-public-methods
         system_packages: str,
         python_version: str,
         execution_metadata: dict,  # pylint: disable=unused-argument
+        branch: str = "",
     ) -> [int, list]:  # exec_id  # changed_file_data  # future_string2
         exec_id, packages_changed = self.fetch_or_create_environment(
-            environment_name, system_packages, python_version
+            environment_name, system_packages, python_version, branch
         )
         return {
             "exec_id": exec_id,
             "filenames": self.all_filenames(),
             "packages_changed": packages_changed,
         }
+
+    def seed_from_branch(
+        self,
+        environment_name: str,
+        system_packages: str,
+        python_version: str,
+        source_branch: str,
+        target_branch: str,
+    ) -> bool:
+        """
+        Copy all test data from source_branch into target_branch for the given
+        environment. Skipped when the target already exists (has data).
+        Returns True when seeding actually happened.
+        """
+        with self.con as con:
+            source = con.execute(
+                """
+                SELECT id FROM environment
+                WHERE environment_name = ? AND system_packages = ?
+                  AND python_version = ? AND branch = ?
+                """,
+                (environment_name, system_packages, python_version, source_branch),
+            ).fetchone()
+            if not source:
+                return False
+
+            target = con.execute(
+                """
+                SELECT id FROM environment
+                WHERE environment_name = ? AND system_packages = ?
+                  AND python_version = ? AND branch = ?
+                """,
+                (environment_name, system_packages, python_version, target_branch),
+            ).fetchone()
+            if target:
+                return False  # target already has data
+
+            now = int(time.time())
+            con.execute(
+                """
+                INSERT INTO environment
+                    (environment_name, system_packages, python_version, branch, last_used_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (environment_name, system_packages, python_version, target_branch, now),
+            )
+            target_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+            con.execute(
+                """
+                INSERT INTO test_execution (environment_id, test_name, duration, failed, forced)
+                SELECT ?, test_name, duration, failed, forced
+                FROM test_execution WHERE environment_id = ?
+                """,
+                (target_id, source["id"]),
+            )
+
+            con.execute(
+                """
+                INSERT INTO test_execution_file_fp (test_execution_id, fingerprint_id)
+                SELECT new_te.id, old_fp.fingerprint_id
+                FROM test_execution old_te
+                JOIN test_execution_file_fp old_fp ON old_fp.test_execution_id = old_te.id
+                JOIN test_execution new_te
+                  ON new_te.test_name = old_te.test_name AND new_te.environment_id = ?
+                WHERE old_te.environment_id = ?
+                """,
+                (target_id, source["id"]),
+            )
+
+            return True
