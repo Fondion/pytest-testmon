@@ -801,9 +801,9 @@ class DB:  # pylint: disable=too-many-public-methods
         locally are kept as-is. Only rows absent from the local DB are copied in,
         preserving any local-only environments the developer has accumulated.
         """
-        with self.con as con:
-            con.execute("ATTACH ? AS src", (src_path,))
-            try:
+        self.con.execute("ATTACH ? AS src", (src_path,))
+        try:
+            with self.con as con:
                 # file_fp is content-addressed — safe to bulk-insert by unique key
                 con.execute(
                     """
@@ -883,5 +883,6 @@ class DB:  # pylint: disable=too-many-public-methods
                     )
                     """
                 )
-            finally:
-                con.execute("DETACH src")
+        finally:
+            # DETACH requires no active transaction — must run after commit/rollback
+            self.con.execute("DETACH src")
