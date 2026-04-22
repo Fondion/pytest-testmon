@@ -204,6 +204,7 @@ class S3Storage:
                 )
                 fresh_db.insert_test_file_fps(delta, exec_id)
                 with fresh_db.con as con:
+                    fresh_db._cleanup_old_environments(con)
                     fresh_db.vacuum_file_fp(con)
                 fresh_db.con.close()
 
