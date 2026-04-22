@@ -27,6 +27,7 @@ from testmon.testmon_core import (
     get_test_execution_class_name,
     get_test_execution_module_name,
     cached_relpath,
+    get_data_file_path,
 )
 from testmon import configure
 from testmon.common import get_logger, get_system_packages, git_current_branch
@@ -129,19 +130,19 @@ def pytest_addoption(parser):
     )
 
     group.addoption(
-        "--testmon-s3-write",
+        "--testmon-s3-readonly",
         action="store_true",
-        dest="testmon_s3_write",
-        help="Merge this run's results back to S3 at session end (requires --testmon-s3).",
+        dest="testmon_s3_readonly",
+        help="Use S3 cache read-only; do not upload results at session end.",
     )
 
     group.addoption(
-        "--testmon-s3-force-pull",
+        "--testmon-s3-force-remote",
         action="store_true",
-        dest="testmon_s3_force_pull",
+        dest="testmon_s3_force_remote",
         help=(
-            "Always re-download the S3 cache even when the local DB already has "
-            "data for the current branch."
+            "Always fetch from S3 and overwrite the current environment's test data. "
+            "Other local-only environments are preserved."
         ),
     )
 
@@ -249,17 +250,26 @@ def init_testmon_data(config: Config):
         from testmon.storage_s3 import S3Storage
         from testmon.common import drop_patch_version
 
-        fallback_branch = config.getini("testmon_s3_fallback_branch") or "main"
-        readonly = not config.getoption("testmon_s3_write")
-        force_pull = config.getoption("testmon_s3_force_pull")
-        s3 = S3Storage(s3_url, readonly=readonly, fallback_branch=fallback_branch)
-        database = s3.setup(force_pull=force_pull)
-
-        # Seed branch data from fallback before initiate_execution so the
-        # seeded environment row is found rather than created empty.
         env_name = environment if environment else "default"
         pkg_str = drop_patch_version(system_packages)
         py_str = f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}"
+
+        fallback_branch = config.getini("testmon_s3_fallback_branch") or "main"
+        readonly = config.getoption("testmon_s3_readonly")
+        force_remote = config.getoption("testmon_s3_force_remote")
+        local_db_path = os.path.join(config.rootdir.strpath, get_data_file_path())
+        s3 = S3Storage(s3_url, readonly=readonly, fallback_branch=fallback_branch)
+        database = s3.setup(
+            local_db_path=local_db_path,
+            env_name=env_name,
+            system_packages=pkg_str,
+            python_version=py_str,
+            branch=branch,
+            force_remote=force_remote,
+        )
+
+        # Seed branch data from fallback before initiate_execution so the
+        # seeded environment row is found rather than created empty.
         s3.seed_from_fallback(env_name, pkg_str, py_str, branch)
 
         config._testmon_s3 = s3

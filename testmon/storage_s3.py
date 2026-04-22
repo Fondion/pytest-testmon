@@ -35,10 +35,10 @@ class S3Storage:
     Wraps a remote SQLite file stored in S3.
 
     Session lifecycle:
-      setup()              – download the S3 file to a temp path, return a DB instance
+      setup()              – use local .testmondata if it exists, else download from S3
       seed_from_fallback() – if the current branch has no data, copy from fallback_branch
       merge_and_upload()   – re-download latest, apply delta, upload with ETag CAS
-      cleanup()            – delete temp file
+      cleanup()            – close the DB connection
     """
 
     def __init__(
@@ -61,27 +61,92 @@ class S3Storage:
     # Public API
     # ------------------------------------------------------------------
 
-    def setup(self, force_pull: bool = False) -> testmon_db.DB:  # pylint: disable=unused-argument
+    def setup(
+        self,
+        local_db_path: str,
+        env_name: str,
+        system_packages: str,
+        python_version: str,
+        branch: str,
+        force_remote: bool = False,
+    ) -> testmon_db.DB:
         """
-        Download the S3 object to a temp file and return an open DB.
+        Prepare the local DB for this session.
 
-        force_pull is accepted for forward-compatibility (future: skip download
-        when local .testmondata already has fresh branch data) but currently
-        always downloads — CI runners have no persistent local state anyway.
+        Decision tree:
+        - Local file missing → merge from S3 (silent if S3 also empty).
+        - Local file exists, current env found, no force_remote → use local as-is (fast).
+        - Local file exists, current env not found → silently merge from S3.
+        - force_remote → always fetch from S3; current env's local test data is replaced,
+          all other local environments are preserved.
         """
-        fd, self._local_db_path = tempfile.mkstemp(suffix=".testmondata.s3")
-        os.close(fd)
+        self._local_db_path = local_db_path
 
-        self._current_etag = self._download_to(self._local_db_path)
-        if self._current_etag is None:
-            logger.info(
-                "testmon: no S3 cache found at %s — starting fresh", self.s3_url
+        need_remote = force_remote or not os.path.exists(local_db_path)
+
+        if not need_remote:
+            probe = testmon_db.DB(local_db_path, readonly=False)
+            env_found = (
+                probe.con.execute(
+                    "SELECT 1 FROM environment "
+                    "WHERE environment_name=? AND system_packages=? "
+                    "AND python_version=? AND branch=?",
+                    (env_name, system_packages, python_version, branch),
+                ).fetchone()
+                is not None
             )
-        else:
-            logger.info("testmon: downloaded S3 cache from %s", self.s3_url)
+            probe.con.close()
+            if env_found:
+                logger.debug("testmon: using local cache at %s", local_db_path)
+                self.local_db = testmon_db.DB(local_db_path, readonly=False)
+                return self.local_db
+            logger.debug("testmon: environment not in local cache, merging from remote")
+            need_remote = True
 
-        self.local_db = testmon_db.DB(self._local_db_path, readonly=False)
+        fd, tmp_path = tempfile.mkstemp(suffix=".testmondata.s3pull")
+        os.close(fd)
+        try:
+            etag = self._download_to(tmp_path)
+            if etag is None:
+                logger.info(
+                    "testmon: no S3 cache found at %s — starting fresh", self.s3_url
+                )
+            else:
+                logger.info("testmon: downloaded S3 cache from %s", self.s3_url)
+                merge_db = testmon_db.DB(local_db_path, readonly=False)
+                if force_remote:
+                    self._clear_env(
+                        merge_db, env_name, system_packages, python_version, branch
+                    )
+                merge_db.merge_from_s3(tmp_path)
+                merge_db.con.close()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
+
+        self.local_db = testmon_db.DB(local_db_path, readonly=False)
         return self.local_db
+
+    @staticmethod
+    def _clear_env(
+        db: "testmon_db.DB",
+        env_name: str,
+        system_packages: str,
+        python_version: str,
+        branch: str,
+    ) -> None:
+        """Delete test_execution rows for the given environment so S3 data replaces them."""
+        with db.con as con:
+            con.execute(
+                "DELETE FROM test_execution WHERE environment_id = ("
+                "  SELECT id FROM environment "
+                "  WHERE environment_name=? AND system_packages=? "
+                "  AND python_version=? AND branch=?"
+                ")",
+                (env_name, system_packages, python_version, branch),
+            )
 
     def seed_from_fallback(
         self,
@@ -191,12 +256,7 @@ class S3Storage:
             except Exception:  # pylint: disable=broad-except
                 pass
             self.local_db = None
-        if self._local_db_path and os.path.exists(self._local_db_path):
-            try:
-                os.unlink(self._local_db_path)
-            except FileNotFoundError:
-                pass
-            self._local_db_path = None
+        self._local_db_path = None
 
     # ------------------------------------------------------------------
     # Internal helpers

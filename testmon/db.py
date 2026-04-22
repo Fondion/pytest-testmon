@@ -792,3 +792,96 @@ class DB:  # pylint: disable=too-many-public-methods
             )
 
             return True
+
+    def merge_from_s3(self, src_path: str) -> None:
+        """
+        Merge test data from *src_path* (a downloaded S3 SQLite file) into this DB.
+
+        Local data always wins: environments and test results that already exist
+        locally are kept as-is. Only rows absent from the local DB are copied in,
+        preserving any local-only environments the developer has accumulated.
+        """
+        with self.con as con:
+            con.execute("ATTACH ? AS src", (src_path,))
+            try:
+                # file_fp is content-addressed — safe to bulk-insert by unique key
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO file_fp (filename, method_checksums, mtime, fsha)
+                    SELECT filename, method_checksums, mtime, fsha FROM src.file_fp
+                    """
+                )
+
+                # Environments: unique on (name, packages, python_version, branch)
+                con.execute(
+                    """
+                    INSERT OR IGNORE INTO environment
+                        (environment_name, system_packages, python_version, branch, last_used_at)
+                    SELECT environment_name, system_packages, python_version, branch, last_used_at
+                    FROM src.environment
+                    """
+                )
+
+                # Test executions: skip any test_name that already exists locally
+                # for the corresponding environment
+                con.execute(
+                    f"""
+                    INSERT INTO test_execution
+                        ({self._test_execution_fk_column()}, test_name, duration, failed, forced)
+                    SELECT
+                        local_env.id,
+                        src_te.test_name,
+                        src_te.duration,
+                        src_te.failed,
+                        src_te.forced
+                    FROM src.test_execution src_te
+                    JOIN src.environment src_env ON src_env.id = src_te.environment_id
+                    JOIN environment local_env ON (
+                        local_env.environment_name = src_env.environment_name AND
+                        local_env.system_packages  = src_env.system_packages  AND
+                        local_env.python_version   = src_env.python_version   AND
+                        local_env.branch           = src_env.branch
+                    )
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM test_execution local_te
+                        WHERE local_te.{self._test_execution_fk_column()} = local_env.id
+                          AND local_te.test_name = src_te.test_name
+                    )
+                    """
+                )
+
+                # File fingerprint links: only for test_executions that have none yet
+                # (i.e. the ones we just imported from S3 above)
+                con.execute(
+                    f"""
+                    INSERT INTO test_execution_file_fp (test_execution_id, fingerprint_id)
+                    SELECT
+                        local_te.id,
+                        local_fp.id
+                    FROM src.test_execution_file_fp src_tefp
+                    JOIN src.test_execution  src_te  ON src_te.id  = src_tefp.test_execution_id
+                    JOIN src.file_fp         src_fp  ON src_fp.id  = src_tefp.fingerprint_id
+                    JOIN src.environment     src_env ON src_env.id = src_te.environment_id
+                    JOIN environment local_env ON (
+                        local_env.environment_name = src_env.environment_name AND
+                        local_env.system_packages  = src_env.system_packages  AND
+                        local_env.python_version   = src_env.python_version   AND
+                        local_env.branch           = src_env.branch
+                    )
+                    JOIN test_execution local_te ON (
+                        local_te.{self._test_execution_fk_column()} = local_env.id AND
+                        local_te.test_name = src_te.test_name
+                    )
+                    JOIN file_fp local_fp ON (
+                        local_fp.filename         = src_fp.filename AND
+                        local_fp.fsha             = src_fp.fsha AND
+                        local_fp.method_checksums = src_fp.method_checksums
+                    )
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM test_execution_file_fp local_tefp
+                        WHERE local_tefp.test_execution_id = local_te.id
+                    )
+                    """
+                )
+            finally:
+                con.execute("DETACH src")
