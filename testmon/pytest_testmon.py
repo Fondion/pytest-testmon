@@ -200,6 +200,13 @@ def pytest_addoption(parser):
         default="30",
     )
     parser.addini(
+        "testmon_max_envs_per_branch",
+        "Maximum number of environments to keep per branch per Python version. "
+        "Older environments (different package sets from the same branch) are removed. "
+        "Set to 0 to disable. Default: 2.",
+        default="2",
+    )
+    parser.addini(
         "testmon_s3_overwrite_branches",
         "Space-separated branch names whose local data is always replaced by S3 data when pulling. "
         "When empty, defaults to 'main' and 'master'. "
@@ -301,12 +308,14 @@ def init_testmon_data(config: Config):
         force_remote = config.getoption("testmon_s3_force_remote")
         local_db_path = os.path.join(config.rootdir.strpath, get_data_file_path())
         env_max_age_days = int(config.getini("testmon_env_max_age_days") or 30)
+        max_envs_per_branch = int(config.getini("testmon_max_envs_per_branch") or 1)
         overwrite_branches_cfg = config.getini("testmon_s3_overwrite_branches")
         s3 = S3Storage(
             s3_url,
             readonly=readonly,
             fallback_branch=fallback_branch,
             env_max_age_days=env_max_age_days,
+            max_envs_per_branch=max_envs_per_branch,
             overwrite_branches=set(overwrite_branches_cfg) if overwrite_branches_cfg else None,
         )
         database = s3.setup(
@@ -589,11 +598,15 @@ class TestmonCollect:
             env_max_age_days = int(
                 session.config.getini("testmon_env_max_age_days") or 30
             )
+            max_envs_per_branch = int(
+                session.config.getini("testmon_max_envs_per_branch") or 2
+            )
             self.testmon_data.db.finish_execution(
                 self.testmon_data.exec_id,
                 time.time() - self._sessionstarttime,
                 session.config.testmon_config.select,
                 env_max_age_days=env_max_age_days,
+                max_envs_per_branch=max_envs_per_branch,
             )
             s3 = getattr(session.config, "_testmon_s3", None)
             if s3 is not None:

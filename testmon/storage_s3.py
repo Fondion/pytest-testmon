@@ -47,6 +47,7 @@ class S3Storage:
         readonly: bool = True,
         fallback_branch: str = "main",
         env_max_age_days: int = 30,
+        max_envs_per_branch: int = 2,
         overwrite_branches: set[str] | None = None,
     ):
         if not HAS_BOTO3:
@@ -57,6 +58,7 @@ class S3Storage:
         self.readonly = readonly
         self.fallback_branch = fallback_branch
         self.env_max_age_days = env_max_age_days
+        self.max_envs_per_branch = max_envs_per_branch
         self._overwrite_branches_config = overwrite_branches
         self._bucket, self._key = _parse_s3_url(s3_url)
         self._s3 = boto3.client("s3")
@@ -217,8 +219,15 @@ class S3Storage:
                 )
                 fresh_db.insert_test_file_fps(delta, exec_id)
                 with fresh_db.con as con:
-                    fresh_db._cleanup_old_environments(con, days=self.env_max_age_days)
+                    fresh_db._cleanup_old_environments(
+                        con,
+                        days=self.env_max_age_days,
+                        max_envs_per_branch=self.max_envs_per_branch,
+                    )
                     fresh_db.vacuum_file_fp(con)
+                # VACUUM must run outside any transaction and rebuilds the file
+                # in-place, physically reclaiming pages freed by the deletes above.
+                fresh_db.con.execute("VACUUM")
                 fresh_db.con.close()
 
                 with open(fresh_path, "rb") as f:

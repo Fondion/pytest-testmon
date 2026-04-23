@@ -101,11 +101,11 @@ class DB:  # pylint: disable=too-many-public-methods
                 "UPDATE file_fp SET mtime=?, fsha=? WHERE id = ?", new_mtimes
             )
 
-    def finish_execution(self, exec_id, duration=None, select=True, env_max_age_days=30):  # pylint: disable=unused-argument
+    def finish_execution(self, exec_id, duration=None, select=True, env_max_age_days=30, max_envs_per_branch=2):  # pylint: disable=unused-argument
         self.update_saving_stats(exec_id, select)
         self.fetch_or_create_file_fp.cache_clear()
         with self.con as con:
-            self._cleanup_old_environments(con, days=env_max_age_days)
+            self._cleanup_old_environments(con, days=env_max_age_days, max_envs_per_branch=max_envs_per_branch)
             self.vacuum_file_fp(con)
 
     def vacuum_file_fp(self, con):
@@ -115,12 +115,32 @@ class DB:  # pylint: disable=too-many-public-methods
                     SELECT DISTINCT fingerprint_id FROM test_execution_file_fp) """
         )
 
-    def _cleanup_old_environments(self, con, days=30):
+    def _cleanup_old_environments(self, con, days=30, max_envs_per_branch=2):
         cutoff = int(time.time()) - days * 24 * 3600
         con.execute(
             "DELETE FROM environment WHERE last_used_at IS NOT NULL AND last_used_at < ?",
             (cutoff,),
         )
+        # Keep only the most recent N environments per (env_name, python_version, branch).
+        # This collapses duplicates that arise from package-string drift between runs.
+        if max_envs_per_branch > 0:
+            con.execute(
+                """
+                DELETE FROM environment
+                WHERE id NOT IN (
+                    SELECT id FROM (
+                        SELECT id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY environment_name, python_version, branch
+                                   ORDER BY COALESCE(last_used_at, 0) DESC
+                               ) AS rn
+                        FROM environment
+                    ) ranked
+                    WHERE rn <= ?
+                )
+                """,
+                (max_envs_per_branch,),
+            )
 
     def fetch_current_run_stats(self, exec_id):
         with self.con as con:
