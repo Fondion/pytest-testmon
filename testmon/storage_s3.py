@@ -42,7 +42,12 @@ class S3Storage:
     """
 
     def __init__(
-        self, s3_url: str, readonly: bool = True, fallback_branch: str = "main"
+        self,
+        s3_url: str,
+        readonly: bool = True,
+        fallback_branch: str = "main",
+        env_max_age_days: int = 30,
+        overwrite_branches: set[str] | None = None,
     ):
         if not HAS_BOTO3:
             raise ImportError(
@@ -51,6 +56,8 @@ class S3Storage:
         self.s3_url = s3_url
         self.readonly = readonly
         self.fallback_branch = fallback_branch
+        self.env_max_age_days = env_max_age_days
+        self._overwrite_branches_config = overwrite_branches
         self._bucket, self._key = _parse_s3_url(s3_url)
         self._s3 = boto3.client("s3")
         self._local_db_path: str | None = None
@@ -118,7 +125,12 @@ class S3Storage:
                     self._clear_env(
                         merge_db, env_name, system_packages, python_version, branch
                     )
-                overwrite_branches = {"main", "master", self.fallback_branch} - {""}
+                if self._overwrite_branches_config is not None:
+                    overwrite_branches = (
+                        set(self._overwrite_branches_config) | {self.fallback_branch}
+                    ) - {""}
+                else:
+                    overwrite_branches = {"main", "master", self.fallback_branch} - {""}
                 merge_db.merge_from_s3(tmp_path, overwrite_branches=overwrite_branches)
                 merge_db.con.close()
         finally:
@@ -205,7 +217,7 @@ class S3Storage:
                 )
                 fresh_db.insert_test_file_fps(delta, exec_id)
                 with fresh_db.con as con:
-                    fresh_db._cleanup_old_environments(con)
+                    fresh_db._cleanup_old_environments(con, days=self.env_max_age_days)
                     fresh_db.vacuum_file_fp(con)
                 fresh_db.con.close()
 

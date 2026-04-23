@@ -101,11 +101,11 @@ class DB:  # pylint: disable=too-many-public-methods
                 "UPDATE file_fp SET mtime=?, fsha=? WHERE id = ?", new_mtimes
             )
 
-    def finish_execution(self, exec_id, duration=None, select=True):  # pylint: disable=unused-argument
+    def finish_execution(self, exec_id, duration=None, select=True, env_max_age_days=30):  # pylint: disable=unused-argument
         self.update_saving_stats(exec_id, select)
         self.fetch_or_create_file_fp.cache_clear()
         with self.con as con:
-            self._cleanup_old_environments(con)
+            self._cleanup_old_environments(con, days=env_max_age_days)
             self.vacuum_file_fp(con)
 
     def vacuum_file_fp(self, con):

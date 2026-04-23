@@ -194,6 +194,21 @@ def pytest_addoption(parser):
         "Branch to seed from when current branch has no S3 cache (default: main).",
         default="main",
     )
+    parser.addini(
+        "testmon_env_max_age_days",
+        "Number of days after which an unused environment is removed from the database (default: 30).",
+        default="30",
+    )
+    parser.addini(
+        "testmon_s3_overwrite_branches",
+        "Space-separated branch names whose local data is always replaced by S3 data when pulling. "
+        "When empty, defaults to 'main' and 'master'. "
+        "The configured fallback branch is always added. "
+        "pyproject.toml: testmon_s3_overwrite_branches = [\"main\", \"staging\"] "
+        "pytest.ini: testmon_s3_overwrite_branches = main staging",
+        type="args",
+        default=[],
+    )
 
 
 def testmon_options(config):
@@ -285,7 +300,15 @@ def init_testmon_data(config: Config):
         readonly = config.getoption("testmon_s3_readonly")
         force_remote = config.getoption("testmon_s3_force_remote")
         local_db_path = os.path.join(config.rootdir.strpath, get_data_file_path())
-        s3 = S3Storage(s3_url, readonly=readonly, fallback_branch=fallback_branch)
+        env_max_age_days = int(config.getini("testmon_env_max_age_days") or 30)
+        overwrite_branches_cfg = config.getini("testmon_s3_overwrite_branches")
+        s3 = S3Storage(
+            s3_url,
+            readonly=readonly,
+            fallback_branch=fallback_branch,
+            env_max_age_days=env_max_age_days,
+            overwrite_branches=set(overwrite_branches_cfg) if overwrite_branches_cfg else None,
+        )
         database = s3.setup(
             local_db_path=local_db_path,
             env_name=env_name,
@@ -563,10 +586,14 @@ class TestmonCollect:
 
     def pytest_sessionfinish(self, session):  # pylint: disable=unused-argument
         if self._running_as in ("single", "controller"):
+            env_max_age_days = int(
+                session.config.getini("testmon_env_max_age_days") or 30
+            )
             self.testmon_data.db.finish_execution(
                 self.testmon_data.exec_id,
                 time.time() - self._sessionstarttime,
                 session.config.testmon_config.select,
+                env_max_age_days=env_max_age_days,
             )
             s3 = getattr(session.config, "_testmon_s3", None)
             if s3 is not None:
