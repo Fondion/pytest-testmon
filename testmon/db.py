@@ -793,17 +793,27 @@ class DB:  # pylint: disable=too-many-public-methods
 
             return True
 
-    def merge_from_s3(self, src_path: str) -> None:
+    def merge_from_s3(self, src_path: str, overwrite_branch: str | None = None) -> None:
         """
         Merge test data from *src_path* (a downloaded S3 SQLite file) into this DB.
 
-        Local data always wins: environments and test results that already exist
-        locally are kept as-is. Only rows absent from the local DB are copied in,
-        preserving any local-only environments the developer has accumulated.
+        Local data wins for all branches except *overwrite_branch* (typically the
+        main/fallback branch): for that branch, local test_execution rows are cleared
+        first so the remote version always takes precedence.
         """
         self.con.execute("ATTACH ? AS src", (src_path,))
         try:
             with self.con as con:
+                if overwrite_branch:
+                    # Remote is authoritative for the main/fallback branch — clear
+                    # local test data so the inserts below repopulate it from S3.
+                    con.execute(
+                        f"DELETE FROM test_execution "
+                        f"WHERE {self._test_execution_fk_column()} IN "
+                        f"(SELECT id FROM environment WHERE branch = ?)",
+                        (overwrite_branch,),
+                    )
+
                 # file_fp is content-addressed — safe to bulk-insert by unique key
                 con.execute(
                     """
