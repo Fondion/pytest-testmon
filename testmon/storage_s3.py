@@ -118,7 +118,8 @@ class S3Storage:
                     self._clear_env(
                         merge_db, env_name, system_packages, python_version, branch
                     )
-                merge_db.merge_from_s3(tmp_path, overwrite_branch=self.fallback_branch)
+                overwrite_branches = {"main", "master", self.fallback_branch} - {""}
+                merge_db.merge_from_s3(tmp_path, overwrite_branches=overwrite_branches)
                 merge_db.con.close()
         finally:
             try:

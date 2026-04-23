@@ -793,25 +793,28 @@ class DB:  # pylint: disable=too-many-public-methods
 
             return True
 
-    def merge_from_s3(self, src_path: str, overwrite_branch: str | None = None) -> None:
+    def merge_from_s3(
+        self, src_path: str, overwrite_branches: set[str] | None = None
+    ) -> None:
         """
         Merge test data from *src_path* (a downloaded S3 SQLite file) into this DB.
 
-        Local data wins for all branches except *overwrite_branch* (typically the
-        main/fallback branch): for that branch, local test_execution rows are cleared
-        first so the remote version always takes precedence.
+        Local data wins for all branches except those in *overwrite_branches*
+        (typically {"main", "master"} plus the configured fallback): for those
+        branches, local test_execution rows are cleared first so remote always wins.
         """
         self.con.execute("ATTACH ? AS src", (src_path,))
         try:
             with self.con as con:
-                if overwrite_branch:
-                    # Remote is authoritative for the main/fallback branch — clear
-                    # local test data so the inserts below repopulate it from S3.
+                if overwrite_branches:
+                    # Remote is authoritative for main-like branches — clear local
+                    # test data so the inserts below repopulate them from S3.
+                    placeholders = ", ".join("?" * len(overwrite_branches))
                     con.execute(
                         f"DELETE FROM test_execution "
                         f"WHERE {self._test_execution_fk_column()} IN "
-                        f"(SELECT id FROM environment WHERE branch = ?)",
-                        (overwrite_branch,),
+                        f"(SELECT id FROM environment WHERE branch IN ({placeholders}))",
+                        tuple(overwrite_branches),
                     )
 
                 # file_fp is content-addressed — safe to bulk-insert by unique key
