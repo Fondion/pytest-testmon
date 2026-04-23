@@ -523,6 +523,10 @@ class TestmonCollector:
 
         self.cov = Coverage(data_file=self.sub_cov_file, config_file=False, **params)
         self.cov._warn_no_data = False
+        # sys.monitoring (PEP 669) is significantly faster than sys.settrace on 3.12+.
+        # coverage.py 7.4+ exposes it via run_core; guard with hasattr for older versions.
+        if sys.version_info >= (3, 12) and hasattr(self.cov.config, "core"):
+            self.cov.config.core = "sysmon"
         if TestmonCollector.coverage_stack:
             TestmonCollector.coverage_stack[-1].stop()
 
