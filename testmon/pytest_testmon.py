@@ -35,6 +35,7 @@ from testmon.common import (
     get_logger,
     get_system_packages,
     get_packages_from_requirements,
+    drop_patch_version,
     git_current_branch,
     git_pr_target_branch,
 )
@@ -225,7 +226,7 @@ def init_testmon_data(config: Config):
         )
     else:
         ignore_dependencies = config.getini("testmon_ignore_dependencies")
-        system_packages = get_system_packages(ignore=ignore_dependencies)
+        system_packages = drop_patch_version(get_system_packages(ignore=ignore_dependencies))
     branch = _resolve_branch(config)
 
     # --- legacy tmnet proxy ---
@@ -271,10 +272,9 @@ def init_testmon_data(config: Config):
         import sys as _sys
 
         from testmon.storage_s3 import S3Storage
-        from testmon.common import drop_patch_version
 
         env_name = environment if environment else "default"
-        pkg_str = drop_patch_version(system_packages)
+        pkg_str = system_packages
         py_str = f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}"
 
         fallback_branch = (

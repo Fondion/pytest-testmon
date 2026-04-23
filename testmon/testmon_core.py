@@ -213,8 +213,7 @@ class TestmonData:  # pylint: disable=too-many-instance-attributes
         self.branch = branch
 
         if system_packages is None:
-            system_packages = get_system_packages()
-        system_packages = drop_patch_version(system_packages)
+            system_packages = drop_patch_version(get_system_packages())
         self.system_packages_str = system_packages
 
         if not python_version:
