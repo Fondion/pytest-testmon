@@ -34,6 +34,7 @@ from testmon import configure
 from testmon.common import (
     get_logger,
     get_system_packages,
+    get_packages_from_requirements,
     git_current_branch,
     git_pr_target_branch,
 )
@@ -172,6 +173,16 @@ def pytest_addoption(parser):
         type="args",
         default=[],
     )
+    parser.addini(
+        "testmon_packages_from",
+        "One or more paths to requirements.txt files used to compute the "
+        "environment key instead of scanning all installed packages. "
+        "Paths are relative to rootdir; -r/-c includes are followed recursively. "
+        "pyproject.toml: testmon_packages_from = [\"requirements/base.txt\", \"requirements/dev.txt\"] "
+        "pytest.ini: testmon_packages_from = requirements/base.txt requirements/dev.txt",
+        type="args",
+        default=[],
+    )
     parser.addini("tmnet_url", "URL of the testmon.net api server.")
     parser.addini("tmnet_api_key", "testmon api key")
     parser.addini(
@@ -207,8 +218,14 @@ def init_testmon_data(config: Config):
     environment = config.getoption("environment_expression") or eval_environment(
         config.getini("environment_expression")
     )
-    ignore_dependencies = config.getini("testmon_ignore_dependencies")
-    system_packages = get_system_packages(ignore=ignore_dependencies)
+    packages_from = config.getini("testmon_packages_from")
+    if packages_from:
+        system_packages = get_packages_from_requirements(
+            packages_from, rootdir=config.rootdir.strpath
+        )
+    else:
+        ignore_dependencies = config.getini("testmon_ignore_dependencies")
+        system_packages = get_system_packages(ignore=ignore_dependencies)
     branch = _resolve_branch(config)
 
     # --- legacy tmnet proxy ---

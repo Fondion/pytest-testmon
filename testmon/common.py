@@ -73,6 +73,47 @@ def get_logger(name):
 logger = get_logger(__name__)
 
 
+def get_packages_from_requirements(paths, rootdir=None) -> str:
+    """
+    Build a packages string from requirements.txt files.
+
+    Recurses into -r / --requirement and -c / --constraint includes.
+    Skips other pip options (lines starting with -).
+    Returns a sorted, deduplicated comma-joined string of package specs.
+    """
+    specs: set[str] = set()
+    _read_requirements(list(paths), rootdir or os.getcwd(), specs, seen=set())
+    return ", ".join(sorted(specs))
+
+
+def _read_requirements(paths, base_dir, specs, seen):
+    for path in paths:
+        abs_path = os.path.normpath(
+            path if os.path.isabs(path) else os.path.join(base_dir, path)
+        )
+        if abs_path in seen:
+            continue
+        seen.add(abs_path)
+        try:
+            with open(abs_path, encoding="utf-8") as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            logger.warning("testmon: requirements file not found: %s", abs_path)
+            continue
+        file_dir = os.path.dirname(abs_path)
+        for raw_line in lines:
+            line = raw_line.split("#")[0].strip()
+            if not line:
+                continue
+            if line.startswith(("-r ", "--requirement ", "-c ", "--constraint ")):
+                include = line.split(None, 1)[1].strip()
+                _read_requirements([include], file_dir, specs, seen)
+            elif line.startswith("-"):
+                continue  # skip other pip options / flags
+            else:
+                specs.add(line)
+
+
 def get_system_packages(ignore=None):
     if not ignore:
         ignore = set(("pytest-testmon", "pytest-testmon"))
