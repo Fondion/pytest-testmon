@@ -250,7 +250,7 @@ class S3Storage:
             except ClientError as exc:
                 code = exc.response["Error"]["Code"]
                 if (
-                    code in ("PreconditionFailed", "ConditionalRequestConflicted")
+                    code in ("PreconditionFailed", "ConditionalRequestConflict")
                     and attempt < _MAX_RETRIES - 1
                 ):
                     sleep = _RETRY_BASE_SLEEP * (2**attempt) * random.uniform(0.5, 1.5)
