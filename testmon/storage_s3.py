@@ -16,8 +16,9 @@ except ImportError:
 
 logger = get_logger(__name__)
 
-_MAX_RETRIES = 10
+_MAX_RETRIES = 15
 _RETRY_BASE_SLEEP = 0.5
+_MAX_RETRY_SLEEP = 10.0
 
 
 def _parse_s3_url(url):
@@ -249,11 +250,13 @@ class S3Storage:
 
             except ClientError as exc:
                 code = exc.response["Error"]["Code"]
-                if (
-                    code in ("PreconditionFailed", "ConditionalRequestConflict")
-                    and attempt < _MAX_RETRIES - 1
-                ):
-                    sleep = _RETRY_BASE_SLEEP * (2**attempt) * random.uniform(0.5, 1.5)
+                if code not in ("PreconditionFailed", "ConditionalRequestConflict"):
+                    raise
+                if attempt < _MAX_RETRIES - 1:
+                    sleep = min(
+                        _RETRY_BASE_SLEEP * (2**attempt) * random.uniform(0.5, 1.5),
+                        _MAX_RETRY_SLEEP,
+                    )
                     logger.info(
                         "testmon: S3 CAS conflict on attempt %d, retrying in %.1fs",
                         attempt + 1,
@@ -261,7 +264,12 @@ class S3Storage:
                     )
                     time.sleep(sleep)
                     continue
-                raise
+                logger.warning(
+                    "testmon: S3 merge failed after %d attempts due to concurrent writes"
+                    " — results not saved to S3 this run",
+                    _MAX_RETRIES,
+                )
+                return
             finally:
                 try:
                     os.unlink(fresh_path)
