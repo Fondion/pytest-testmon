@@ -16,9 +16,9 @@ except ImportError:
 
 logger = get_logger(__name__)
 
-_MAX_RETRIES = 15
+_MAX_RETRIES = 10
 _RETRY_BASE_SLEEP = 0.5
-_MAX_RETRY_SLEEP = 10.0
+_MAX_RETRY_SLEEP = 30.0
 
 
 def _parse_s3_url(url):
@@ -79,6 +79,7 @@ class S3Storage:
         python_version: str,
         branch: str,
         force_remote: bool = False,
+        target_branch: str | None = None,
     ) -> testmon_db.DB:
         """
         Prepare the local DB for this session.
@@ -89,6 +90,9 @@ class S3Storage:
         - Local file exists, current env not found → silently merge from S3.
         - force_remote → always fetch from S3; current env's local test data is replaced,
           all other local environments are preserved.
+
+        S3 fallback chain for downloads:
+          branch key → target_branch key (if given) → fallback_branch key
         """
         self._local_db_path = local_db_path
 
@@ -116,7 +120,24 @@ class S3Storage:
         fd, tmp_path = tempfile.mkstemp(suffix=".testmondata.s3pull")
         os.close(fd)
         try:
-            etag = self._download_to(tmp_path)
+            branch_key = self._branch_key(branch)
+            etag = self._download_to(tmp_path, key=branch_key)
+            if etag is None and target_branch and target_branch != branch:
+                target_key = self._branch_key(target_branch)
+                if target_key != branch_key:
+                    logger.debug(
+                        "testmon: no S3 cache for branch %r, trying target branch %r",
+                        branch,
+                        target_branch,
+                    )
+                    etag = self._download_to(tmp_path, key=target_key)
+            if etag is None and branch_key != self._key:
+                logger.debug(
+                    "testmon: no S3 cache for branch %r, trying fallback %r",
+                    branch,
+                    self.fallback_branch,
+                )
+                etag = self._download_to(tmp_path, key=self._key)
             if etag is None:
                 logger.info(
                     "testmon: no S3 cache found at %s — starting fresh", self.s3_url
@@ -208,11 +229,13 @@ class S3Storage:
         if not delta:
             return
 
+        branch_key = self._branch_key(branch)
+
         for attempt in range(_MAX_RETRIES):
             fd, fresh_path = tempfile.mkstemp(suffix=".testmondata.merge")
             os.close(fd)
             try:
-                etag = self._download_to(fresh_path)
+                etag = self._download_to(fresh_path, key=branch_key)
                 fresh_db = testmon_db.DB(fresh_path, readonly=False)
 
                 exec_id, _ = fresh_db.fetch_or_create_environment(
@@ -236,7 +259,7 @@ class S3Storage:
 
                 put_kwargs: dict = {
                     "Bucket": self._bucket,
-                    "Key": self._key,
+                    "Key": branch_key,
                     "Body": data,
                 }
                 if etag is not None:
@@ -293,10 +316,18 @@ class S3Storage:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _download_to(self, path: str) -> str | None:
-        """Download the S3 object to *path*. Returns ETag or None if missing."""
+    def _branch_key(self, branch: str) -> str:
+        """Return the S3 key for *branch*. Main/fallback branch uses the base key."""
+        if not branch or branch == self.fallback_branch:
+            return self._key
+        safe = branch.replace("/", "-").replace("\\", "-")
+        return f"{self._key}-{safe}"
+
+    def _download_to(self, path: str, key: str | None = None) -> str | None:
+        """Download the S3 object at *key* to *path*. Returns ETag or None if missing."""
+        key = key if key is not None else self._key
         try:
-            response = self._s3.get_object(Bucket=self._bucket, Key=self._key)
+            response = self._s3.get_object(Bucket=self._bucket, Key=key)
             with open(path, "wb") as f:
                 f.write(response["Body"].read())
             return response["ETag"]

@@ -299,11 +299,8 @@ def init_testmon_data(config: Config):
         pkg_str = system_packages
         py_str = f"{_sys.version_info.major}.{_sys.version_info.minor}.{_sys.version_info.micro}"
 
-        fallback_branch = (
-            git_pr_target_branch()
-            or config.getini("testmon_s3_fallback_branch")
-            or "main"
-        )
+        fallback_branch = config.getini("testmon_s3_fallback_branch") or "main"
+        target_branch = git_pr_target_branch()
         readonly = config.getoption("testmon_s3_readonly")
         force_remote = config.getoption("testmon_s3_force_remote")
         local_db_path = os.path.join(config.rootdir.strpath, get_data_file_path())
@@ -325,6 +322,7 @@ def init_testmon_data(config: Config):
             python_version=py_str,
             branch=branch,
             force_remote=force_remote,
+            target_branch=target_branch,
         )
 
         # Seed branch data from fallback before initiate_execution so the
