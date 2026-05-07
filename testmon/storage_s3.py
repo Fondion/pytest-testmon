@@ -131,13 +131,15 @@ class S3Storage:
                         target_branch,
                     )
                     etag = self._download_to(tmp_path, key=target_key)
-            if etag is None and branch_key != self._key:
-                logger.debug(
-                    "testmon: no S3 cache for branch %r, trying fallback %r",
-                    branch,
-                    self.fallback_branch,
-                )
-                etag = self._download_to(tmp_path, key=self._key)
+            if etag is None:
+                fallback_key = self._branch_key(self.fallback_branch)
+                if fallback_key != branch_key:
+                    logger.debug(
+                        "testmon: no S3 cache for branch %r, trying fallback %r",
+                        branch,
+                        self.fallback_branch,
+                    )
+                    etag = self._download_to(tmp_path, key=fallback_key)
             if etag is None:
                 logger.info(
                     "testmon: no S3 cache found at %s — starting fresh", self.s3_url
@@ -191,28 +193,38 @@ class S3Storage:
         system_packages: str,
         python_version: str,
         branch: str,
+        target_branch: str | None = None,
     ) -> bool:
         """
-        If the current branch has no data, copy rows from fallback_branch.
+        If the current branch has no data, copy rows into it.
+        Tries target_branch first (for chained PRs), then fallback_branch.
         Must be called after setup() but before TestmonData.for_local_run()
         so the seeded environment row is found by fetch_or_create_environment.
         """
         if not self.local_db or branch == self.fallback_branch or not branch:
             return False
-        seeded = self.local_db.seed_from_branch(
-            environment_name,
-            system_packages,
-            python_version,
-            self.fallback_branch,
-            branch,
-        )
-        if seeded:
-            logger.info(
-                "testmon: seeded branch %r from %r in local S3 cache",
+
+        candidates = []
+        if target_branch and target_branch != branch and target_branch != self.fallback_branch:
+            candidates.append(target_branch)
+        candidates.append(self.fallback_branch)
+
+        for source in candidates:
+            seeded = self.local_db.seed_from_branch(
+                environment_name,
+                system_packages,
+                python_version,
+                source,
                 branch,
-                self.fallback_branch,
             )
-        return seeded
+            if seeded:
+                logger.info(
+                    "testmon: seeded branch %r from %r in local S3 cache",
+                    branch,
+                    source,
+                )
+                return True
+        return False
 
     def merge_and_upload(
         self,
@@ -317,11 +329,9 @@ class S3Storage:
     # ------------------------------------------------------------------
 
     def _branch_key(self, branch: str) -> str:
-        """Return the S3 key for *branch*. Main/fallback branch uses the base key."""
-        if not branch or branch == self.fallback_branch:
-            return self._key
-        safe = branch.replace("/", "-").replace("\\", "-")
-        return f"{self._key}-{safe}"
+        """Return the S3 key for *branch* as `{base_key}/{branch}/.testmondata`."""
+        safe = "/".join(part for part in branch.replace("\\", "/").split("/") if part)
+        return f"{self._key}/{safe}/.testmondata" if safe else f"{self._key}/.testmondata"
 
     def _download_to(self, path: str, key: str | None = None) -> str | None:
         """Download the S3 object at *key* to *path*. Returns ETag or None if missing."""

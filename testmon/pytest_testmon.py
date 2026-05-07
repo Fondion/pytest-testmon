@@ -327,7 +327,7 @@ def init_testmon_data(config: Config):
 
         # Seed branch data from fallback before initiate_execution so the
         # seeded environment row is found rather than created empty.
-        s3.seed_from_fallback(env_name, pkg_str, py_str, branch)
+        s3.seed_from_fallback(env_name, pkg_str, py_str, branch, target_branch=target_branch)
 
         config._testmon_s3 = s3
 
