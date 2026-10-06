@@ -1,10 +1,12 @@
 import os
 import random
+import sqlite3
 import tempfile
 import time
 
 from testmon import db as testmon_db
 from testmon.common import get_logger
+from testmon.testmon_core import TestmonException
 
 try:
     import boto3
@@ -40,6 +42,9 @@ class S3Storage:
       seed_from_fallback() – if the current branch has no data, copy from fallback_branch
       merge_and_upload()   – re-download latest, apply delta, upload with ETag CAS
       cleanup()            – close the DB connection
+
+    With read_branch set, setup() opens a private copy of that branch's object
+    and the session neither seeds nor uploads.
     """
 
     def __init__(
@@ -50,13 +55,16 @@ class S3Storage:
         env_max_age_days: int = 30,
         max_envs_per_branch: int = 2,
         overwrite_branches: set[str] | None = None,
+        read_branch: str | None = None,
     ):
         if not HAS_BOTO3:
             raise ImportError(
                 "boto3 is required for --testmon-s3. Install it with: pip install boto3"
             )
         self.s3_url = s3_url
-        self.readonly = readonly
+        # A read-branch snapshot is never written back.
+        self.read_branch = read_branch or None
+        self.readonly = readonly or self.read_branch is not None
         self.fallback_branch = fallback_branch
         self.env_max_age_days = env_max_age_days
         self.max_envs_per_branch = max_envs_per_branch
@@ -66,6 +74,7 @@ class S3Storage:
         self._local_db_path: str | None = None
         self.local_db: testmon_db.DB | None = None
         self._current_etag: str | None = None
+        self._owns_local_db_file = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -84,6 +93,9 @@ class S3Storage:
         """
         Prepare the local DB for this session.
 
+        With read_branch set (--testmon-s3-read-branch) none of the below applies:
+        see _setup_read_branch().
+
         Decision tree:
         - Local file missing → merge from S3 (silent if S3 also empty).
         - Local file exists, current env found, no force_remote → use local as-is (fast).
@@ -94,6 +106,9 @@ class S3Storage:
         S3 fallback chain for downloads:
           branch key → target_branch key (if given) → fallback_branch key
         """
+        if self.read_branch:
+            return self._setup_read_branch()
+
         self._local_db_path = local_db_path
 
         need_remote = force_remote or not os.path.exists(local_db_path)
@@ -117,53 +132,51 @@ class S3Storage:
             logger.debug("testmon: environment not in local cache, merging from remote")
             need_remote = True
 
-        fd, tmp_path = tempfile.mkstemp(suffix=".testmondata.s3pull")
-        os.close(fd)
+        downloaded = []
+        found_any = False
         try:
-            branch_key = self._branch_key(branch)
-            etag = self._download_to(tmp_path, key=branch_key)
-            if etag is None and target_branch and target_branch != branch:
-                target_key = self._branch_key(target_branch)
-                if target_key != branch_key:
-                    logger.debug(
-                        "testmon: no S3 cache for branch %r, trying target branch %r",
-                        branch,
-                        target_branch,
-                    )
-                    etag = self._download_to(tmp_path, key=target_key)
-            if etag is None:
-                fallback_key = self._branch_key(self.fallback_branch)
-                if fallback_key != branch_key:
-                    logger.debug(
-                        "testmon: no S3 cache for branch %r, trying fallback %r",
-                        branch,
-                        self.fallback_branch,
-                    )
-                    etag = self._download_to(tmp_path, key=fallback_key)
-            if etag is None:
-                logger.info(
-                    "testmon: no S3 cache found at %s — starting fresh", self.s3_url
-                )
-            else:
-                logger.info("testmon: downloaded S3 cache from %s", self.s3_url)
+            for source_branch, key in self._download_chain(branch, target_branch):
+                fd, tmp_path = tempfile.mkstemp(suffix=".testmondata.s3pull")
+                os.close(fd)
+                downloaded.append(tmp_path)
+                if self._download_to(tmp_path, key=key) is None:
+                    logger.debug("testmon: no S3 cache for branch %r", source_branch)
+                    continue
+                logger.info("testmon: downloaded S3 cache for branch %r", source_branch)
                 merge_db = testmon_db.DB(local_db_path, readonly=False)
-                if force_remote:
+                if force_remote and not found_any:
                     self._clear_env(
                         merge_db, env_name, system_packages, python_version, branch
                     )
-                if self._overwrite_branches_config is not None:
-                    overwrite_branches = (
-                        set(self._overwrite_branches_config) | {self.fallback_branch}
-                    ) - {""}
-                else:
-                    overwrite_branches = {"main", "master", self.fallback_branch} - {""}
-                merge_db.merge_from_s3(tmp_path, overwrite_branches=overwrite_branches)
+                found_any = True
+                merge_db.merge_from_s3(
+                    tmp_path, overwrite_branches=self._overwrite_branches()
+                )
                 merge_db.con.close()
+                # Stop at the first object that holds the current environment
+                # (same packages hash) for the branch it belongs to. Otherwise
+                # keep going down the chain so seed_from_fallback() has a row for
+                # the current packages hash to copy, instead of every test
+                # re-running after a requirements change on the target branch.
+                if self._has_environment(
+                    tmp_path, env_name, system_packages, python_version, source_branch
+                ):
+                    break
+                logger.debug(
+                    "testmon: S3 cache for branch %r has no environment for the "
+                    "current packages, trying the next branch",
+                    source_branch,
+                )
+            if not found_any:
+                logger.info(
+                    "testmon: no S3 cache found at %s — starting fresh", self.s3_url
+                )
         finally:
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
+            for path in downloaded:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
 
         self.local_db = testmon_db.DB(local_db_path, readonly=False)
         return self.local_db
@@ -201,7 +214,12 @@ class S3Storage:
         Must be called after setup() but before TestmonData.for_local_run()
         so the seeded environment row is found by fetch_or_create_environment.
         """
-        if not self.local_db or branch == self.fallback_branch or not branch:
+        if (
+            not self.local_db
+            or self.read_branch
+            or branch == self.fallback_branch
+            or not branch
+        ):
             return False
 
         candidates = []
@@ -238,7 +256,7 @@ class S3Storage:
         Re-download the latest S3 file, apply our delta, upload with ETag CAS.
         Retries on concurrent-write conflicts up to _MAX_RETRIES times.
         """
-        if not delta:
+        if not delta or self.readonly:
             return
 
         branch_key = self._branch_key(branch)
@@ -322,11 +340,87 @@ class S3Storage:
             except Exception:  # pylint: disable=broad-except
                 pass
             self.local_db = None
+        if self._owns_local_db_file and self._local_db_path:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(self._local_db_path + suffix)
+                except FileNotFoundError:
+                    pass
+            self._owns_local_db_file = False
         self._local_db_path = None
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _setup_read_branch(self) -> testmon_db.DB:
+        """
+        Open a private copy of the read branch's S3 object as this session's DB.
+
+        The local .testmondata is neither read nor written, nothing is seeded,
+        and the copy is deleted in cleanup(). The caller uses read_branch as the
+        session's branch, so selection runs against that branch's environment.
+        """
+        fd, snapshot_path = tempfile.mkstemp(suffix=".testmondata.readbranch")
+        os.close(fd)
+        key = self._branch_key(self.read_branch)
+        if self._download_to(snapshot_path, key=key) is None:
+            os.unlink(snapshot_path)
+            raise TestmonException(
+                f"testmon: --testmon-s3-read-branch={self.read_branch!r} has no S3 "
+                f"object at s3://{self._bucket}/{key}"
+            )
+        logger.info(
+            "testmon: using read-only S3 snapshot of branch %r", self.read_branch
+        )
+        self._local_db_path = snapshot_path
+        self._owns_local_db_file = True
+        self.local_db = testmon_db.DB(snapshot_path, readonly=False)
+        return self.local_db
+
+    def _download_chain(self, branch: str, target_branch: str | None):
+        """Yield (branch, key) pairs in download order, skipping duplicate keys."""
+        seen = set()
+        for candidate in (branch, target_branch, self.fallback_branch):
+            if candidate is None:
+                continue
+            key = self._branch_key(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield candidate, key
+
+    def _overwrite_branches(self) -> set[str]:
+        if self._overwrite_branches_config is not None:
+            branches = set(self._overwrite_branches_config) | {self.fallback_branch}
+        else:
+            branches = {"main", "master", self.fallback_branch}
+        return branches - {""}
+
+    @staticmethod
+    def _has_environment(
+        path: str,
+        env_name: str,
+        system_packages: str,
+        python_version: str,
+        branch: str,
+    ) -> bool:
+        """True when the SQLite file at *path* has a row for this exact environment."""
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return (
+                con.execute(
+                    "SELECT 1 FROM environment "
+                    "WHERE environment_name=? AND system_packages=? "
+                    "AND python_version=? AND branch=?",
+                    (env_name, system_packages, python_version, branch),
+                ).fetchone()
+                is not None
+            )
+        except sqlite3.Error:
+            return False
+        finally:
+            con.close()
 
     def _branch_key(self, branch: str) -> str:
         """Return the S3 key for *branch* as `{base_key}/{branch}/.testmondata`."""
