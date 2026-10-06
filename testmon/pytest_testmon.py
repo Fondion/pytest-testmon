@@ -167,6 +167,20 @@ def pytest_addoption(parser):
         ),
     )
 
+    group.addoption(
+        "--testmon-s3-read-branch",
+        action="store",
+        dest="testmon_s3_read_branch",
+        default=None,
+        metavar="BRANCH",
+        help=(
+            "Select tests against a read-only snapshot of BRANCH's S3 object "
+            "(e.g. master). Only that object is downloaded, the local .testmondata "
+            "is not used, nothing is seeded and nothing is uploaded. "
+            "Meant for CI pull-request runs together with --testmon-nocollect."
+        ),
+    )
+
     parser.addini("environment_expression", "environment expression", default="")
     parser.addini(
         "testmon_ignore_dependencies",
@@ -188,6 +202,11 @@ def pytest_addoption(parser):
     parser.addini("tmnet_api_key", "testmon api key")
     parser.addini(
         "testmon_s3_url", "S3 URL for shared testmon cache (s3://bucket/key)."
+    )
+    parser.addini(
+        "testmon_s3_read_branch",
+        "Branch whose S3 object is used as a read-only snapshot "
+        "(see --testmon-s3-read-branch).",
     )
     parser.addini(
         "testmon_s3_fallback_branch",
@@ -290,6 +309,14 @@ def init_testmon_data(config: Config):
 
     running_as = get_running_as(config)
 
+    read_branch = config.getoption("testmon_s3_read_branch") or config.getini(
+        "testmon_s3_read_branch"
+    )
+    if read_branch and not s3_url:
+        raise TestmonException(
+            "--testmon-s3-read-branch requires --testmon-s3 (or testmon_s3_url)"
+        )
+
     if s3_url and running_as != "worker":
         import sys as _sys
 
@@ -314,7 +341,11 @@ def init_testmon_data(config: Config):
             env_max_age_days=env_max_age_days,
             max_envs_per_branch=max_envs_per_branch,
             overwrite_branches=set(overwrite_branches_cfg) if overwrite_branches_cfg else None,
+            read_branch=read_branch,
         )
+        if read_branch:
+            # Look up the snapshot's own environment rows, as if this were that branch.
+            branch = read_branch
         database = s3.setup(
             local_db_path=local_db_path,
             env_name=env_name,

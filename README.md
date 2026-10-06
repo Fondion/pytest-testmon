@@ -20,6 +20,22 @@ affected tests](https://testmon.org/blog/determining-affected-tests/)
 To learn more about different options you can use with testmon, please
 head to [testmon.org](https://testmon.org)
 
+## Shared cache in S3 (this fork)
+
+    pip install "pytest-testmon[s3]"
+    pytest --testmon-s3=s3://bucket/prefix
+
+Each branch reads and writes `s3://bucket/prefix/<branch>/.testmondata`. A branch
+with no data, or with no data for the current packages hash (e.g. after a
+requirements bump on the target branch), is seeded from the PR target branch
+(`GITHUB_BASE_REF` etc.) and then `testmon_s3_fallback_branch` (default `main`).
+
+`--testmon-s3-read-branch=master` selects against a read-only snapshot of that
+branch's object only: no local `.testmondata`, no seeding, no upload, and an
+error if the object does not exist. Pair it with `--testmon-nocollect` on CI
+pull-request runs so a PR runs the tests affected by its diff against master
+and never writes its own object.
+
 ## Call for opensource projects: try testmon in CI with no effort or risk.
 
 We would like to run testmon within your project, collect data and improve!
