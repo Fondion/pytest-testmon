@@ -204,3 +204,48 @@ def test_read_branch_plugin_run(fake_s3, pytester):
     result.stdout.no_fnmatch_line("*test_a.py::test_a*")
     assert fake_s3.puts == ["testmon/master/.testmondata"]
     assert not (pytester.path / ".testmondata").exists()
+
+
+def test_read_branch_with_xdist_workers(fake_s3, pytester, monkeypatch, tmp_path):
+    pytest.importorskip("xdist")
+    snapshot_dir = tmp_path / "tmp"
+    snapshot_dir.mkdir()
+    monkeypatch.setattr(storage_s3.tempfile, "tempdir", str(snapshot_dir))
+    pytester.makeconftest("""
+        import os
+
+        def pytest_collection_finish(session):
+            worker = os.environ.get("PYTEST_XDIST_WORKER")
+            if worker:
+                with open(f"selected_{worker}.txt", "w") as f:
+                    f.write("\\n".join(item.nodeid for item in session.items))
+        """)
+    pytester.makepyfile(
+        test_a="def test_a():\n    assert True\n",
+        test_c="def test_c():\n    assert True\n",
+    )
+    s3_args = (f"--testmon-s3={S3_URL}",)
+
+    pytester.runpytest_inprocess(*s3_args, "--testmon-s3-branch=master")
+    assert fake_s3.puts == ["testmon/master/.testmondata"]
+
+    os.remove(pytester.path / ".testmondata")
+    pytester.makepyfile(test_b="def test_b():\n    assert True\n")
+    result = pytester.runpytest_inprocess(
+        *s3_args,
+        "--testmon-s3-branch=feature",
+        "--testmon-s3-read-branch=master",
+        "--testmon-nocollect",
+        "-n",
+        "2",
+    )
+
+    result.assert_outcomes(passed=1)
+    selected = {
+        worker: (pytester.path / f"selected_{worker}.txt").read_text().split()
+        for worker in ("gw0", "gw1")
+    }
+    assert selected == {"gw0": ["test_b.py::test_b"], "gw1": ["test_b.py::test_b"]}
+    assert fake_s3.puts == ["testmon/master/.testmondata"]
+    assert not (pytester.path / ".testmondata").exists()
+    assert not list(snapshot_dir.glob("*.readbranch*"))  # snapshot copy removed

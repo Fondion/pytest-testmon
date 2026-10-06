@@ -53,6 +53,14 @@ def check_data_version(connection, datafile, data_version):
     if int(stored_data_version) == data_version:
         return connection, False
 
+    if int(stored_data_version) == 0 and not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+    ).fetchone():
+        # Brand-new empty file, possibly just created by a concurrent process
+        # that is about to initialise it. Don't delete it from under that
+        # process; the caller's init_tables() is idempotent.
+        return connection, True
+
     connection.close()
     os.remove(datafile)
     connection = connect(datafile)
@@ -363,11 +371,11 @@ class DB:  # pylint: disable=too-many-public-methods
                 )
 
     def _create_metadata_statement(self) -> str:
-        return """CREATE TABLE metadata (dataid TEXT PRIMARY KEY, data TEXT);"""
+        return """CREATE TABLE IF NOT EXISTS metadata (dataid TEXT PRIMARY KEY, data TEXT);"""
 
     def _create_environment_statement(self) -> str:
         return """
-                CREATE TABLE environment (
+                CREATE TABLE IF NOT EXISTS environment (
                 id INTEGER PRIMARY KEY ASC,
                 environment_name TEXT,
                 system_packages TEXT,
@@ -379,7 +387,7 @@ class DB:  # pylint: disable=too-many-public-methods
 
     def _create_test_execution_statement(self) -> str:  # pylint: disable=invalid-name
         return f"""
-                CREATE TABLE test_execution (
+                CREATE TABLE IF NOT EXISTS test_execution (
                 id INTEGER PRIMARY KEY ASC,
                 {self._test_execution_fk_column()} INTEGER,
                 test_name TEXT,
@@ -387,7 +395,7 @@ class DB:  # pylint: disable=too-many-public-methods
                 failed BIT,
                 forced BIT,
                 FOREIGN KEY({self._test_execution_fk_column()}) REFERENCES {self._test_execution_fk_table()}(id) ON DELETE CASCADE);
-                CREATE INDEX test_execution_fk_name ON test_execution ({self._test_execution_fk_column()}, test_name);
+                CREATE INDEX IF NOT EXISTS test_execution_fk_name ON test_execution ({self._test_execution_fk_column()}, test_name);
             """
 
     def _create_temp_tables_statement(self) -> str:
@@ -396,15 +404,15 @@ class DB:  # pylint: disable=too-many-public-methods
     def _local_temp_tables_statement(self) -> str:
         return """
                 CREATE TEMPORARY TABLE changed_files_fshas (exec_id INTEGER, filename TEXT, fsha TEXT);
-                CREATE INDEX changed_files_fshas_mcall ON changed_files_fshas (exec_id, filename, fsha);
+                CREATE INDEX IF NOT EXISTS changed_files_fshas_mcall ON changed_files_fshas (exec_id, filename, fsha);
 
                 CREATE TEMPORARY TABLE changed_files_mhashes (exec_id INTEGER, filename TEXT, mhashes BLOB);
-                CREATE INDEX changed_files_mhashes_eid ON changed_files_mhashes (exec_id);
+                CREATE INDEX IF NOT EXISTS changed_files_mhashes_eid ON changed_files_mhashes (exec_id);
         """
 
     def _create_file_fp_statement(self) -> str:
         return """
-            CREATE TABLE file_fp
+            CREATE TABLE IF NOT EXISTS file_fp
             (
                 id INTEGER PRIMARY KEY,
                 filename TEXT,
@@ -418,36 +426,40 @@ class DB:  # pylint: disable=too-many-public-methods
         self,
     ) -> str:
         return """
-            CREATE TABLE test_execution_file_fp (
+            CREATE TABLE IF NOT EXISTS test_execution_file_fp (
                 test_execution_id INTEGER,
                 fingerprint_id INTEGER,
                 FOREIGN KEY(test_execution_id) REFERENCES test_execution(id) ON DELETE CASCADE,
                 FOREIGN KEY(fingerprint_id) REFERENCES file_fp(id)
             );
-            CREATE INDEX test_execution_file_fp_both ON test_execution_file_fp (test_execution_id, fingerprint_id);
+            CREATE INDEX IF NOT EXISTS test_execution_file_fp_both ON test_execution_file_fp (test_execution_id, fingerprint_id);
             -- the following table stores the same data coarsely, but is used for faster queries
-            CREATE TABLE suite_execution_file_fsha (
+            CREATE TABLE IF NOT EXISTS suite_execution_file_fsha (
                 suite_execution_id INTEGER,
                 filename TEXT,
                 fsha text,
                 FOREIGN KEY(suite_execution_id) REFERENCES suite_execution(id) ON DELETE CASCADE
                 );
-                CREATE UNIQUE INDEX sefch_suite_id_filename_sha ON suite_execution_file_fsha(suite_execution_id, filename, fsha);
+                CREATE UNIQUE INDEX IF NOT EXISTS sefch_suite_id_filename_sha ON suite_execution_file_fsha(suite_execution_id, filename, fsha);
             """
 
     def init_tables(self):
         connection = self.con
 
+        # One write transaction, with the version stamp inside it: another
+        # process opening the same new file sees either no tables or all of them,
+        # and the IF NOT EXISTS clauses make a second init a no-op.
         connection.executescript(
-            self._create_metadata_statement()
+            "BEGIN IMMEDIATE;"
+            + self._create_metadata_statement()
             + self._create_environment_statement()
             + self._create_test_execution_statement()
             + self._create_temp_tables_statement()
             + self._create_file_fp_statement()
             + self._create_test_execution_ffp_statement()
+            + f"PRAGMA user_version = {self.version_compatibility()};"
+            + "COMMIT;"
         )
-
-        connection.execute(f"PRAGMA user_version = {self.version_compatibility()}")
 
     def fetch_changed_file_data(self, changed_fingerprints, exec_id) -> []:
         in_clause_questionsmarks = ", ".join("?" * len(changed_fingerprints))

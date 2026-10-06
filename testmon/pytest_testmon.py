@@ -432,8 +432,14 @@ def register_plugins(config, should_select, should_collect, cov_plugin):
             ),
             "TestmonCollect",
         )
-        if config.pluginmanager.hasplugin("xdist"):
-            config.pluginmanager.register(TestmonXdistSync())
+
+    # Also without collection (--testmon-nocollect): the workers need the
+    # controller's exec_id and DB path, otherwise each worker initialises its own
+    # local run and they race on creating the same .testmondata.
+    if (should_select or should_collect) and config.pluginmanager.hasplugin("xdist"):
+        config.pluginmanager.register(
+            TestmonXdistSync(sync_fs_tests=should_collect), "TestmonXdistSync"
+        )
 
 
 def pytest_configure(config):
@@ -542,6 +548,11 @@ def changed_message(
 def pytest_unconfigure(config):
     if hasattr(config, "testmon_data"):
         config.testmon_data.close_connection()
+    # TestmonCollect cleans up at session finish; with --testmon-nocollect it is
+    # not registered, so drop the S3 temp copy (e.g. the read-branch snapshot) here.
+    s3 = getattr(config, "_testmon_s3", None)
+    if s3 is not None:
+        s3.cleanup()
 
 
 class TestmonCollect:
@@ -658,8 +669,9 @@ class TestmonCollect:
 
 
 class TestmonXdistSync:
-    def __init__(self):
+    def __init__(self, sync_fs_tests=True):
         self.await_nodes = 0
+        self.sync_fs_tests = sync_fs_tests
 
     def pytest_configure_node(self, node):
         """
@@ -696,7 +708,7 @@ class TestmonXdistSync:
 
     def pytest_xdist_node_collection_finished(self, node, ids):  # pylint: disable=invalid-name
         self.await_nodes += -1
-        if self.await_nodes == 0:
+        if self.await_nodes == 0 and self.sync_fs_tests:
             node.config.testmon_data.sync_db_fs_tests(retain=set(ids))
 
 
