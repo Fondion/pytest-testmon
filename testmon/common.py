@@ -140,14 +140,52 @@ def drop_patch_version(system_packages):
 # .git utilities
 #
 def git_path(start_path=None):  # parent dirs only
+    """
+    Return the git dir of the checkout containing *start_path*.
+
+    Stops at the nearest `.git` entry. In a linked worktree or submodule `.git`
+    is a file (`gitdir: <path>`) pointing at the checkout's own git dir, e.g.
+    `<main>/.git/worktrees/<name>`, whose HEAD is the worktree's branch.
+    """
     start_path = Path(start_path or os.getcwd()).resolve()
     current_path = start_path
     while current_path != current_path.parent:  # '/'.parent == '/'
         path = current_path / ".git"
-        if path.exists() and path.is_dir():
+        if path.is_dir():
             return str(path)
+        if path.is_file():
+            return _read_gitdir_file(path)
         current_path = current_path.parent
     return None
+
+
+def _read_gitdir_file(path):
+    try:
+        content = path.read_text(encoding="utf8").strip()
+    except OSError:
+        return None
+    if not content.startswith("gitdir:"):
+        return None
+    git_dir = (path.parent / content[len("gitdir:") :].strip()).resolve()
+    return str(git_dir) if git_dir.is_dir() else None
+
+
+def _git_common_dir(git_dir):
+    """Shared dir holding refs/ and packed-refs (differs from git_dir in a worktree)."""
+    try:
+        with open(os.path.join(git_dir, "commondir"), "r", encoding="utf8") as f:
+            common = f.read().strip()
+    except FileNotFoundError:
+        return git_dir
+    return str((Path(git_dir) / common).resolve())
+
+
+def _read_head(git_dir):
+    try:
+        with open(os.path.join(git_dir, "HEAD"), "r", encoding="utf8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
 
 
 def git_current_branch(path=None):
@@ -170,17 +208,15 @@ def git_current_branch(path=None):
         if branch := os.environ.get(var, "").strip():
             return branch
 
-    # Fall back to reading the .git/HEAD file directly.
+    # Fall back to reading the checkout's own HEAD file directly.
     git_dir = git_path(path)
     if not git_dir:
         return None
-    try:
-        with open(os.path.join(git_dir, "HEAD"), "r", encoding="utf8") as f:
-            head = f.read().strip()
-        if head.startswith("ref:"):
-            return head.split("/")[-1]  # e.g. "ref: refs/heads/main" → "main"
-    except FileNotFoundError:
-        pass
+    head = _read_head(git_dir)
+    if head and head.startswith("ref:"):
+        ref = head[len("ref:") :].strip()
+        # "ref: refs/heads/feature/x" → "feature/x"
+        return ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
     return None  # detached HEAD with no CI env var
 
 
@@ -208,17 +244,27 @@ def git_pr_target_branch() -> str | None:
 
 
 def git_current_head(path=None):
-    path = git_path(path)
-    if not path:
+    git_dir = git_path(path)
+    if not git_dir:
         return None
-    current_branch = git_current_branch(path)
-    if not current_branch:
+    head = _read_head(git_dir)
+    if not head:
         return None
-    git_branch_file = os.path.join(path, "refs", "heads", current_branch)
+    if not head.startswith("ref:"):
+        return head  # detached HEAD holds the sha itself
+    ref = head[len("ref:") :].strip()
+    common_dir = _git_common_dir(git_dir)
     try:
-        with open(git_branch_file, "r", encoding="utf8") as branch_file:
-            head_sha = branch_file.read().strip()
-        return head_sha
+        with open(os.path.join(common_dir, ref), "r", encoding="utf8") as ref_file:
+            return ref_file.read().strip()
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    try:
+        with open(os.path.join(common_dir, "packed-refs"), "r", encoding="utf8") as f:
+            for line in f:
+                parts = line.strip().split(" ", 1)
+                if len(parts) == 2 and parts[1] == ref:
+                    return parts[0]
     except FileNotFoundError:
         pass
     return None
